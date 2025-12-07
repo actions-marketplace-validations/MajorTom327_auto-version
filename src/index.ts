@@ -1,6 +1,6 @@
 import { setFailed, getInput } from "@actions/core";
 import { Context } from "@actions/github/lib/context";
-import { compose, join, props, evolve, inc, assoc } from "ramda";
+import { compose, join, props, evolve, inc, assoc, split } from "ramda";
 import { Gh } from "./Gh";
 import * as fs from "fs-extra";
 
@@ -18,31 +18,65 @@ const run = async () => {
   // then the latestVersion is equal to the tag name
 
   const isTag =
-    context.eventName === "push" && context.ref.startsWith("refs/tags/");
-  const updatedVersion = await match(isTag)
-    .with(true, () => Promise.resolve(context.ref.replace("refs/tags/", "")))
-    .otherwise(async () => {
-      const latestVersion = gh.getLatestVersion(repository);
-      // @ts-expect-error type
-      return compose(
-        join("."),
-        props(["major", "minor", "patch"]),
-        evolve({
-          patch: inc,
-        })
-      )(latestVersion);
-    });
+    context.eventName === "push" &&
+    context.ref.startsWith("refs/tags/") &&
+    false; // Hack: Doesn't enable the tag for now
 
-  fs.readFile("./package.json", "utf8")
+  let updatedVersion: string;
+  if (isTag) {
+    logger.info(`Getting latest version for ${repository} from tag`);
+    updatedVersion = context.ref.replace("refs/tags/", "");
+  } else {
+    logger.info(
+      `Getting latest version for ${repository} from registry and incrementing patch version`
+    );
+    const latestVersion = await gh.getLatestVersion(repository).catch(() => {
+      return fs
+        .readFile("package.json", "utf8")
+        .then((data) => JSON.parse(data))
+        .then((pkg) => {
+          const previousVersion = pkg.version ?? "0.0.0";
+          const [major, minor, patch] = split(".")(previousVersion);
+
+          const version = {
+            major: ~~major,
+            minor: ~~minor,
+            patch: ~~patch,
+          };
+
+          console.log("New version:", { version });
+
+          return version;
+        });
+    });
+    // @ts-expect-error type
+    updatedVersion = compose(
+      join("."),
+      props(["major", "minor", "patch"]),
+      evolve({
+        patch: inc,
+      })
+    )(latestVersion);
+  }
+
+  return fs
+    .readFile("./package.json", "utf8")
     .then((data) => {
       const updatedData = assoc("version", updatedVersion, JSON.parse(data));
 
       return updatedData;
     })
     .then((updatedPackage) => {
-      return fs.writeFile("./package.json", JSON.stringify(updatedPackage));
+      return fs.writeFile(
+        "./package.json",
+        JSON.stringify(updatedPackage, null, 2)
+      );
     })
-    .then(() => {});
+    .then(() => {
+      logger.info(`Updated package.json to version ${updatedVersion}`);
+      gh.commit(updatedVersion);
+    })
+    .then(() => true);
 };
 
 run().catch((error) => {
